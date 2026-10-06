@@ -142,9 +142,14 @@ class EduLead extends Model
             ->orderBy('id', 'desc')
             ->first();
 
-        $newNumber = $lastLead
-            ? str_pad((int) substr($lastLead->lead_code, -4) + 1, 4, '0', STR_PAD_LEFT)
-            : '0001';
+        if ($lastLead) {
+            $parts = explode('-', $lastLead->lead_code);
+            $lastNum = (int) end($parts);
+            $nextNum = $lastNum + 1;
+            $newNumber = str_pad($nextNum, max(4, strlen((string) $nextNum)), '0', STR_PAD_LEFT);
+        } else {
+            $newNumber = '0001';
+        }
 
         return "{$prefix}-{$year}-{$newNumber}";
     }

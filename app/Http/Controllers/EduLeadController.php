@@ -387,12 +387,26 @@ class EduLeadController extends Controller
         } catch (\Illuminate\Database\QueryException $e) {
             Log::error('Lead creation DB error: ' . $e->getMessage());
             if ($e->errorInfo[1] === 1062) {
-                $field = str_contains($e->getMessage(), 'phone') ? 'phone' : 'field';
-                return response()->json([
-                    'success' => false,
-                    'message' => 'This phone number is already registered.',
-                    'errors'  => ['phone' => ['This phone number already exists in the system.']],
-                ], 422);
+                $msg = $e->getMessage();
+                if (str_contains($msg, 'whatsapp_number')) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This WhatsApp number is already registered.',
+                        'errors'  => ['whatsapp_number' => ['This WhatsApp number already exists in the system.']],
+                    ], 422);
+                } elseif (str_contains($msg, 'lead_code')) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This lead code is already registered.',
+                        'errors'  => ['lead_code' => ['This lead code already exists in the system.']],
+                    ], 422);
+                } else {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This phone number is already registered.',
+                        'errors'  => ['phone' => ['This phone number already exists in the system.']],
+                    ], 422);
+                }
             }
             return response()->json([
                 'success' => false,
@@ -558,11 +572,26 @@ class EduLeadController extends Controller
         } catch (\Illuminate\Database\QueryException $e) {
             Log::error('Lead update DB error: ' . $e->getMessage());
             if ($e->errorInfo[1] === 1062) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'This phone number is already registered.',
-                    'errors'  => ['phone' => ['This phone number already exists in the system.']],
-                ], 422);
+                $msg = $e->getMessage();
+                if (str_contains($msg, 'whatsapp_number')) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This WhatsApp number is already registered.',
+                        'errors'  => ['whatsapp_number' => ['This WhatsApp number already exists in the system.']],
+                    ], 422);
+                } elseif (str_contains($msg, 'lead_code')) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This lead code is already registered.',
+                        'errors'  => ['lead_code' => ['This lead code already exists in the system.']],
+                    ], 422);
+                } else {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This phone number is already registered.',
+                        'errors'  => ['phone' => ['This phone number already exists in the system.']],
+                    ], 422);
+                }
             }
             return response()->json([
                 'success' => false,
