@@ -14,6 +14,7 @@ class EduLead extends Model
 
     protected $fillable = [
         'lead_code',
+        'is_pre_lead',
         'created_by',
         'assigned_to',
         'branch_id',
@@ -72,6 +73,7 @@ class EduLead extends Model
     ];
 
     protected $casts = [
+        'is_pre_lead'     => 'boolean',
         'call_date'       => 'date',
         'followup_date'   => 'date',
         'admitted_at'     => 'datetime',
@@ -213,6 +215,9 @@ class EduLead extends Model
     }
 
     // ── Scopes ────────────────────────────────────────────────────────
+
+    public function scopeRegularLeads($query)  { return $query->where('is_pre_lead', false); }
+    public function scopePreLeads($query)      { return $query->where('is_pre_lead', true); }
 
     public function scopeHot($query)           { return $query->where('interest_level', 'hot'); }
     public function scopeWarm($query)          { return $query->where('interest_level', 'warm'); }
