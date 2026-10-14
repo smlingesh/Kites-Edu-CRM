@@ -9,6 +9,7 @@ use App\Models\EduLeadSource;
 use App\Models\User;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -247,6 +248,14 @@ class EduLeadBulkImportController extends Controller
     // =========================================================================
     // MAP COLUMNS
     // =========================================================================
+    private function normalizeHeader(string $header): string
+    {
+        $h = preg_replace('/[\x{2705}\x{FE0F}\x{200D}]/u', '', $header) ?? $header;
+        $h = preg_replace('/\s+/u', ' ', trim($h));
+
+        return strtolower($h);
+    }
+
     private function mapColumns(array $headerArray): array
     {
         $patterns = [
@@ -278,7 +287,7 @@ class EduLeadBulkImportController extends Controller
 
         // Pass 1: exact match
         foreach ($headerArray as $index => $header) {
-            $h = strtolower(trim((string)$header));
+            $h = $this->normalizeHeader((string) $header);
             if (empty($h)) continue;
             foreach ($patterns as $field => $alternatives) {
                 if (!isset($mapping[$field])) {
@@ -291,7 +300,7 @@ class EduLeadBulkImportController extends Controller
 
         // Pass 2: contains match
         foreach ($headerArray as $index => $header) {
-            $h = strtolower(trim((string)$header));
+            $h = $this->normalizeHeader((string) $header);
             if (empty($h)) continue;
             foreach ($patterns as $field => $alternatives) {
                 if (isset($mapping[$field])) continue;
@@ -312,7 +321,7 @@ class EduLeadBulkImportController extends Controller
     // =========================================================================
     public function preValidateImport(Request $request)
     {
-        $request->validate(['csv_file' => 'required|file|mimes:csv,txt,xlsx,xls|max:10240']);
+        $this->validateImportFile($request);
 
         try {
             $file   = $request->file('csv_file');
@@ -379,6 +388,13 @@ class EduLeadBulkImportController extends Controller
 
             $total = count($phones);
 
+            if ($total === 0) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No importable rows found. Download the template, fill rows under the header (Mobile Number required, 10–15 digits), and remove or replace the sample row.',
+                ], 422);
+            }
+
             $existingPhone    = EduLead::whereIn('phone', $phones)->count();
             $existingWhatsapp = !empty($whatsapps)
                 ? EduLead::whereIn('whatsapp_number', $whatsapps)->count()
@@ -418,9 +434,7 @@ class EduLeadBulkImportController extends Controller
     // =========================================================================
     public function processBulkImport(Request $request)
     {
-        $request->validate([
-            'csv_file' => 'required|file|mimes:csv,txt,xlsx,xls|max:10240',
-        ]);
+        $this->validateImportFile($request);
 
         set_time_limit(600);
         ini_set('memory_limit', '512M');
@@ -514,7 +528,14 @@ class EduLeadBulkImportController extends Controller
 
             if ($totalRows === 0) {
                 DB::rollBack();
-                return response()->json(['success' => false, 'message' => 'No valid data rows found.'], 400);
+                $skipHint = !empty($skipped)
+                    ? ' Skipped sheets: ' . collect($skipped)->map(fn ($s) => "{$s['name']} ({$s['reason']})")->join('; ')
+                    : '';
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No valid data rows found. Check Mobile Number column and use the latest Excel template.' . $skipHint,
+                    'skipped_sheets' => $skipped,
+                ], 422);
             }
 
             if ($totalRows > 3000) {
@@ -529,10 +550,10 @@ class EduLeadBulkImportController extends Controller
             $seenPhones = [];
 
             $progressKey = "import_progress_{$import->id}";
-            Cache::put($progressKey, [
+            $this->putImportProgress($progressKey, [
                 'total' => $totalRows, 'processed' => 0, 'successful' => 0,
                 'failed' => 0, 'status' => 'processing', 'current_sheet' => null,
-            ], now()->addMinutes(30));
+            ]);
 
             foreach (array_chunk($records, 100) as $chunk) {
                 foreach ($chunk as $row) {
@@ -574,19 +595,9 @@ class EduLeadBulkImportController extends Controller
                         }
 
                         // ── 5. Lead Source ────────────────────────────────────
-                        $leadSource = null;
-                        if (!empty($row['lead_source'])) {
-                            $leadSource = EduLeadSource::whereRaw('LOWER(name) = ?', [strtolower($row['lead_source'])])
-                                ->where('is_active', true)->first()
-                                ?? EduLeadSource::whereRaw('LOWER(name) LIKE ?', ['%' . strtolower($row['lead_source']) . '%'])
-                                    ->where('is_active', true)->first();
-                        }
+                        $leadSource = $this->resolveLeadSourceForImport($row['lead_source'] ?? null);
                         if (!$leadSource) {
-                            $leadSource = EduLeadSource::where('is_active', true)
-                                ->where(fn($q) => $q->whereRaw('LOWER(name) = ?', ['others'])
-                                    ->orWhereRaw('LOWER(name) = ?', ['bulk import']))
-                                ->first()
-                                ?? EduLeadSource::where('is_active', true)->first();
+                            throw new \Exception('No lead source configured. Add an active lead source in Admin or use “Source of Lead” in the file.');
                         }
 
                         // ── 6. Telecaller ─────────────────────────────────────
@@ -721,6 +732,7 @@ class EduLeadBulkImportController extends Controller
 
                         // ── 13. Create new lead ───────────────────────────────
                         EduLead::create([
+                            'is_pre_lead'        => false,
                             'phone'              => $phone,
                             'name'               => !empty($row['student_name']) ? trim($row['student_name']) : 'Lead-' . substr($phone, -4),
                             'whatsapp_number'    => $cleanWhatsapp,
@@ -762,23 +774,23 @@ class EduLeadBulkImportController extends Controller
                     $processed++;
 
                     if ($processed % 5 === 0) {
-                        Cache::put($progressKey, [
+                        $this->putImportProgress($progressKey, [
                             'total'         => $totalRows,
                             'processed'     => $processed,
                             'successful'    => $successful,
                             'failed'        => $failed,
                             'current_sheet' => $row['sheet_name'],
                             'status'        => 'processing',
-                        ], now()->addMinutes(30));
+                        ]);
                     }
                 }
                 gc_collect_cycles();
             }
 
-            Cache::put($progressKey, [
+            $this->putImportProgress($progressKey, [
                 'total' => $totalRows, 'processed' => $processed,
                 'successful' => $successful, 'failed' => $failed, 'status' => 'completed',
-            ], now()->addMinutes(30));
+            ]);
 
             $import->update([
                 'status'           => $failed === $totalRows ? 'failed' : 'completed',
@@ -909,6 +921,55 @@ class EduLeadBulkImportController extends Controller
     // =========================================================================
     // HELPERS
     // =========================================================================
+    private function validateImportFile(Request $request): void
+    {
+        $request->validate([
+            'csv_file' => 'required|file|max:10240',
+        ]);
+
+        $ext = strtolower($request->file('csv_file')->getClientOriginalExtension());
+        if (! in_array($ext, ['csv', 'txt', 'xlsx', 'xls'], true)) {
+            throw ValidationException::withMessages([
+                'csv_file' => ['The file must be CSV or Excel (.csv, .xlsx, .xls).'],
+            ]);
+        }
+    }
+
+    private function putImportProgress(string $key, array $payload): void
+    {
+        try {
+            Cache::put($key, $payload, now()->addMinutes(30));
+        } catch (\Throwable $e) {
+            Log::warning('Import progress cache unavailable: ' . $e->getMessage());
+        }
+    }
+
+    private function resolveLeadSourceForImport(?string $name): ?EduLeadSource
+    {
+        $name = trim((string) $name);
+        if ($name !== '') {
+            $found = EduLeadSource::where('is_active', true)
+                ->whereRaw('LOWER(name) = ?', [strtolower($name)])
+                ->first()
+                ?? EduLeadSource::where('is_active', true)
+                    ->whereRaw('LOWER(name) LIKE ?', ['%' . strtolower($name) . '%'])
+                    ->first();
+            if ($found) {
+                return $found;
+            }
+        }
+
+        return EduLeadSource::where('is_active', true)
+            ->where(fn ($q) => $q->whereRaw('LOWER(name) = ?', ['bulk import'])
+                ->orWhereRaw('LOWER(name) = ?', ['others']))
+            ->first()
+            ?? EduLeadSource::where('is_active', true)->orderBy('id')->first()
+            ?? EduLeadSource::firstOrCreate(
+                ['name' => 'Bulk Import'],
+                ['description' => 'Default source for bulk lead imports', 'is_active' => true],
+            );
+    }
+
     private function buildRecord(array $row, array $colMap, string $sheetName, int $excelRow): array
     {
         return [

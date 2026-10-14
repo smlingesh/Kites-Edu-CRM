@@ -441,6 +441,29 @@ function clearFile() {
     stopProgressPolling();
 }
 
+function buildImportFormData() {
+    const file = fileInput.files[0];
+    if (!file) {
+        throw new Error('Please select a file first.');
+    }
+    const fd = new FormData();
+    fd.append('csv_file', file);
+    fd.append('_token', document.querySelector('meta[name="csrf-token"]').content);
+    return fd;
+}
+
+async function readErrorMessage(response) {
+    const text = await response.text();
+    try {
+        const json = JSON.parse(text);
+        if (json.message) return json.message;
+        if (json.errors?.csv_file?.[0]) return json.errors.csv_file[0];
+    } catch (_) {
+        /* not JSON */
+    }
+    return text?.slice(0, 500) || `Server error (${response.status})`;
+}
+
 // Start polling for progress updates
 function startProgressPolling(importId) {
     currentImportId = importId;
@@ -492,13 +515,14 @@ function stopProgressPolling() {
 document.getElementById('uploadForm').addEventListener('submit', async function(e) {
     e.preventDefault();
 
-    const formData = new FormData(this);
     const uploadBtn = document.getElementById('uploadBtn');
 
     uploadBtn.disabled = true;
     uploadBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Validating...';
 
     try {
+        const formData = buildImportFormData();
+
         // Step 1: Pre-validate the file
         updateProgress(10, 'Analyzing file for duplicates...');
         document.getElementById('progressContainer').style.display = 'block';
@@ -512,13 +536,13 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
         });
 
         if (!preValidateResponse.ok) {
-            throw new Error('Pre-validation failed');
+            throw new Error(await readErrorMessage(preValidateResponse));
         }
 
         const validation = await preValidateResponse.json();
 
         if (!validation.success) {
-            throw new Error(validation.message);
+            throw new Error(validation.message || 'Pre-validation failed');
         }
 
         updateProgress(20, 'Validation complete...');
@@ -587,25 +611,30 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
             }
         }
 
-        // Step 3: Proceed with actual import
+        // Step 3: Proceed with actual import (fresh FormData so the file is sent again)
         uploadBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Importing...';
         updateProgress(30, 'Starting import process...');
 
+        const importFormData = buildImportFormData();
         const response = await fetch('{{ route("edu-leads.process-bulk-import") }}', {
             method: 'POST',
             headers: {
                 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
             },
-            body: formData
+            body: importFormData
         });
 
         if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Server error:', errorText);
-            throw new Error(`Server error: ${response.status}`);
+            throw new Error(await readErrorMessage(response));
         }
 
         const result = await response.json();
+
+        if (result.stats) {
+            document.getElementById('rowProgress').textContent = `${result.stats.processed} / ${result.stats.total}`;
+            document.getElementById('successProgress').textContent = result.stats.successful;
+            document.getElementById('failedProgress').textContent = result.stats.failed;
+        }
 
         // Start progress polling
         if (result.import_id) {
@@ -638,18 +667,29 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
 async function waitForCompletion(result) {
     const uploadBtn = document.getElementById('uploadBtn');
 
-    // Wait for progress polling to complete
-    await new Promise((resolve) => {
-        const checkComplete = setInterval(() => {
-            const progressBar = document.getElementById('progressBar');
-            const width = parseFloat(progressBar.style.width);
+    if (result.stats?.total > 0 && result.stats.processed >= result.stats.total) {
+        updateProgress(100, 'Import completed!');
+        stopProgressPolling();
+    } else {
+        // Wait for progress polling to complete (with timeout)
+        await new Promise((resolve, reject) => {
+            const started = Date.now();
+            const checkComplete = setInterval(() => {
+                if (Date.now() - started > 120000) {
+                    clearInterval(checkComplete);
+                    reject(new Error('Import is taking longer than expected. Check Recent Imports on the right for status.'));
+                    return;
+                }
+                const progressBar = document.getElementById('progressBar');
+                const width = parseFloat(progressBar.style.width) || 0;
 
-            if (width >= 100) {
-                clearInterval(checkComplete);
-                setTimeout(resolve, 500);
-            }
-        }, 500);
-    });
+                if (width >= 100) {
+                    clearInterval(checkComplete);
+                    setTimeout(resolve, 500);
+                }
+            }, 500);
+        });
+    }
 
     // Show final results
     if (result.success || (result.stats && result.stats.successful > 0)) {
